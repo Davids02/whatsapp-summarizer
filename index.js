@@ -113,8 +113,8 @@ async function connectToWhatsApp() {
 
             if (!text) continue;
 
-            const myPhoneJid = sock.user.id.split(':') + '@s.whatsapp.net';
-            const myLid = sock.user.lid ? sock.user.lid.split(':') + '@lid' : '';
+            const myPhoneJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
+            const myLid = sock.user.lid ? sock.user.lid.split(':')[0] + '@lid' : '';
             const isSelfChat = (chatId === myPhoneJid || chatId === myLid);
 
             const trimmedText = text.trim();
