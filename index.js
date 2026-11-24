@@ -5,6 +5,10 @@ const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
 
+const http = require('http');
+const QRCode = require('qrcode');
+let latestQrDataUrl = null;
+
 // 1. OpenAI API Key loaded securely from Railway environment variables
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY
