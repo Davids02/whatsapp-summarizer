@@ -78,7 +78,7 @@ async function connectToWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            const qrUrl = `https://qrserver.com{encodeURIComponent(qr)}`;
+            const qrUrl = 'https://qrserver.com' + encodeURIComponent(qr);
             console.log('CLICK THIS LINK FOR QR:', qrUrl);
         }
 
