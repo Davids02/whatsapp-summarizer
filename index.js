@@ -255,4 +255,13 @@ async function connectToWhatsApp() {
     });
 }
 
+http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    if (latestQrDataUrl) {
+        res.end(`<div style="text-align:center;margin-top:50px;"><h2>Scan with WhatsApp</h2><img src="${latestQrDataUrl}" style="width:300px;height:300px;"/><p>Refresh page if expired</p></div>`);
+    } else {
+        res.end('<h2 style="text-align:center;margin-top:50px;">Connected or waiting for QR...</h2>');
+    }
+}).listen(process.env.PORT || 3000);
+
 connectToWhatsApp();
