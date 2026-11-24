@@ -79,9 +79,8 @@ async function connectToWhatsApp() {
 
         if (qr) {
             const qrUrl = `https://qrserver.com{encodeURIComponent(qr)}`;
-            console.log('\nOpen this link in your browser to scan the QR code:\n' + qrUrl + '\n');
+            console.log('CLICK THIS LINK FOR QR:', qrUrl);
         }
-
 
         if (connection === 'close') {
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
