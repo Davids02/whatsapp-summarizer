@@ -61,7 +61,7 @@ async function summarizeMessages(messagesList) {
         ],
     });
 
-    return response.choices.message.content;
+    return response.choices[0].message.content;
 }
 
 async function connectToWhatsApp() {
