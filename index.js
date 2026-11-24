@@ -1,15 +1,12 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const OpenAI = require('openai');
-const qrcode = require('qrcode-terminal');
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
-
 const http = require('http');
 const QRCode = require('qrcode');
-let latestQrDataUrl = null;
 
-// 1. OpenAI API Key loaded securely from Railway environment variables
+// 1. OpenAI API Key loaded from Railway environment variables
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY
 });
@@ -42,6 +39,8 @@ let selectedGroups = loadSelectedGroups();
 let lastFetchedGroupsList = [];
 const TWO_DAYS_MS = 2 * 24 * 60 * 60 * 1000;
 let messageBuffer = [];
+let latestQrDataUrl = null;
+let connectionStatus = 'Initializing...';
 
 async function summarizeMessages(messagesList) {
     const formattedChat = messagesList
@@ -64,6 +63,7 @@ async function summarizeMessages(messagesList) {
 
     return response.choices.message.content;
 }
+
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
@@ -78,21 +78,23 @@ async function connectToWhatsApp() {
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', (update) => {
+    sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
+
         if (qr) {
             latestQrDataUrl = await QRCode.toDataURL(qr);
-            console.log('QR image updated! Open your Railway public URL to scan.');
-        }
-        if (connection === 'open') {
-            latestQrDataUrl = null;
+            connectionStatus = 'Waiting for QR scan...';
+            console.log('QR image generated! Refresh your Railway domain URL to scan.');
         }
 
         if (connection === 'close') {
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            connectionStatus = 'Connection closed. Reconnecting...';
             console.log('Connection closed. Reconnecting:', shouldReconnect);
             if (shouldReconnect) connectToWhatsApp();
         } else if (connection === 'open') {
+            latestQrDataUrl = null;
+            connectionStatus = 'Connected successfully!';
             const activeCount = Object.keys(selectedGroups).length;
             console.log(`\nConnected successfully! Currently tracking ${activeCount} groups.`);
         }
@@ -255,13 +257,17 @@ async function connectToWhatsApp() {
     });
 }
 
+// Start HTTP server immediately on 0.0.0.0 so Railway healthcheck and QR page always respond
+const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     if (latestQrDataUrl) {
-        res.end(`<div style="text-align:center;margin-top:50px;"><h2>Scan with WhatsApp</h2><img src="${latestQrDataUrl}" style="width:300px;height:300px;"/><p>Refresh page if expired</p></div>`);
+        res.end(`<div style="text-align:center;font-family:sans-serif;margin-top:50px;"><h2>Scan with WhatsApp</h2><img src="${latestQrDataUrl}" style="width:300px;height:300px;border:1px solid #ccc;"/><p>Refresh page if expired</p></div>`);
     } else {
-        res.end('<h2 style="text-align:center;margin-top:50px;">Connected or waiting for QR...</h2>');
+        res.end(`<div style="text-align:center;font-family:sans-serif;margin-top:50px;"><h2>Status: ${connectionStatus}</h2><p>Refresh in a few seconds if waiting for QR...</p></div>`);
     }
-}).listen(process.env.PORT || 3000);
+}).listen(PORT, '0.0.0.0', () => {
+    console.log(`Web server listening on port ${PORT}`);
+});
 
 connectToWhatsApp();
