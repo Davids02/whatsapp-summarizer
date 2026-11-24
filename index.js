@@ -80,10 +80,12 @@ async function connectToWhatsApp() {
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
-
         if (qr) {
-            const qrUrl = 'https://qrserver.com' + encodeURIComponent(qr);
-            console.log('CLICK THIS LINK FOR QR:', qrUrl);
+            latestQrDataUrl = await QRCode.toDataURL(qr);
+            console.log('QR image updated! Open your Railway public URL to scan.');
+        }
+        if (connection === 'open') {
+            latestQrDataUrl = null;
         }
 
         if (connection === 'close') {
