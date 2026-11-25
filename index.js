@@ -156,16 +156,24 @@ async function connectToWhatsApp() {
         }
 
         if (connection === 'close') {
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            connectionStatus = 'Connection closed. Reconnecting...';
-            console.log('Connection closed. Reconnecting:', shouldReconnect);
-            if (shouldReconnect) connectToWhatsApp();
+            const isLoggedOut = lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut;
+            if (isLoggedOut) {
+                console.log('Logged out from phone. Clearing old auth session and generating new QR...');
+                fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                connectionStatus = 'Logged out. Generating new QR...';
+                connectToWhatsApp();
+            } else {
+                connectionStatus = 'Connection closed. Reconnecting...';
+                console.log('Connection closed. Reconnecting...');
+                connectToWhatsApp();
+            }
         } else if (connection === 'open') {
             latestQrDataUrl = null;
             connectionStatus = 'Connected successfully!';
             const activeCount = Object.keys(selectedGroups).length;
             console.log(`\nConnected successfully! Tracking ${activeCount} groups. Stored messages (last 7 days): ${messageBuffer.length}`);
         }
+
     });
 
     // Catch past messages pushed by WhatsApp upon linking, keeping only the last 7 days
