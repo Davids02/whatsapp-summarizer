@@ -157,7 +157,7 @@ async function connectToWhatsApp() {
 
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 428) {
                 console.log('Session logged out (401). Clearing auth directory...');
                 fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                 connectionStatus = 'Logged out. Generating new QR...';
