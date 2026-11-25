@@ -156,17 +156,16 @@ async function connectToWhatsApp() {
         }
 
         if (connection === 'close') {
-            const isLoggedOut = lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut;
-            if (isLoggedOut) {
-                console.log('Logged out from phone. Clearing old auth session and generating new QR...');
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+                console.log('Session logged out (401). Clearing auth directory...');
                 fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                 connectionStatus = 'Logged out. Generating new QR...';
-                connectToWhatsApp();
             } else {
-                connectionStatus = 'Connection closed. Reconnecting...';
-                console.log('Connection closed. Reconnecting...');
-                connectToWhatsApp();
+                connectionStatus = 'Connection closed. Reconnecting in 3s...';
+                console.log(`Connection closed (code: ${statusCode}). Reconnecting in 3s...`);
             }
+            setTimeout(() => connectToWhatsApp(), 3000);
         } else if (connection === 'open') {
             latestQrDataUrl = null;
             connectionStatus = 'Connected successfully!';
