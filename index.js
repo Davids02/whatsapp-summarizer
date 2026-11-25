@@ -19,30 +19,37 @@ if (!fs.existsSync(DATA_DIR)) {
 
 const AUTH_DIR = path.join(DATA_DIR, 'auth_info_baileys');
 const GROUPS_FILE = path.join(DATA_DIR, 'selected_groups.json');
+const MESSAGES_FILE = path.join(DATA_DIR, 'messages_history.json');
+const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 
-function loadSelectedGroups() {
-    if (fs.existsSync(GROUPS_FILE)) {
+const DAY_MS = 24 * 60 * 60 * 1000;
+const MAX_RETENTION_DAYS = 30; // Keep messages on disk for up to 30 days
+
+// Helper functions to load and save persistent JSON files
+function loadJson(filePath, fallback) {
+    if (fs.existsSync(filePath)) {
         try {
-            return JSON.parse(fs.readFileSync(GROUPS_FILE, 'utf8'));
+            return JSON.parse(fs.readFileSync(filePath, 'utf8'));
         } catch (err) {
-            console.error('Error reading selected_groups.json, starting empty.');
+            console.error(`Error reading ${filePath}, using fallback.`);
         }
     }
-    return {};
+    return fallback;
 }
 
-function saveSelectedGroups(groupsObj) {
-    fs.writeFileSync(GROUPS_FILE, JSON.stringify(groupsObj, null, 2), 'utf8');
+function saveJson(filePath, data) {
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
 }
 
-let selectedGroups = loadSelectedGroups();
+let selectedGroups = loadJson(GROUPS_FILE, {});
+let messageBuffer = loadJson(MESSAGES_FILE, []);
+let appConfig = loadJson(CONFIG_FILE, { defaultDays: 2 });
+
 let lastFetchedGroupsList = [];
-const TWO_DAYS_MS = 2 * 24 * 60 * 60 * 1000;
-let messageBuffer = [];
 let latestQrDataUrl = null;
 let connectionStatus = 'Initializing...';
 
-async function summarizeMessages(messagesList) {
+async function summarizeMessages(messagesList, daysCount) {
     const formattedChat = messagesList
         .map(m => `[${m.groupName}] ${m.sender}: ${m.text}`)
         .join('\n');
@@ -56,13 +63,14 @@ async function summarizeMessages(messagesList) {
             },
             {
                 role: 'user',
-                content: `Please summarize the following messages collected over the last 2 days:\n\n${formattedChat}`
+                content: `Please summarize the following messages collected over the last ${daysCount} day(s):\n\n${formattedChat}`
             }
         ],
     });
 
-    return response.choices[0].message.content;
+    return response.choices.message.content;
 }
+
 
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -96,7 +104,7 @@ async function connectToWhatsApp() {
             latestQrDataUrl = null;
             connectionStatus = 'Connected successfully!';
             const activeCount = Object.keys(selectedGroups).length;
-            console.log(`\nConnected successfully! Currently tracking ${activeCount} groups.`);
+            console.log(`\nConnected successfully! Tracking ${activeCount} groups. Default window: ${appConfig.defaultDays} days.`);
         }
     });
 
@@ -113,14 +121,15 @@ async function connectToWhatsApp() {
 
             if (!text) continue;
 
-            const myPhoneJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
-            const myLid = sock.user.lid ? sock.user.lid.split(':')[0] + '@lid' : '';
+            const myPhoneJid = sock.user.id.split(':') + '@s.whatsapp.net';
+            const myLid = sock.user.lid ? sock.user.lid.split(':') + '@lid' : '';
             const isSelfChat = (chatId === myPhoneJid || chatId === myLid);
 
             const trimmedText = text.trim();
             const command = trimmedText.toLowerCase();
 
             if (isFromMe && isSelfChat) {
+                // 1. List all WhatsApp groups
                 if (command === 'list' || command === 'רשימה') {
                     await sock.sendMessage(chatId, { text: 'Fetching your WhatsApp groups...' });
                     try {
@@ -141,7 +150,7 @@ async function connectToWhatsApp() {
                             })
                             .join('\n');
 
-                        const helpFooter = '\n\nTo track, send: *select 1, 4, 7*\nTo untrack, send: *remove 1, 4*';
+                        const helpFooter = '\n\nCommands:\n• *select 1, 4*\n• *remove 1, 4*\n• *summarize 3* (days back)\n• *days 5* (set default days)';
                         await sock.sendMessage(chatId, { text: `*Your WhatsApp Groups (${lastFetchedGroupsList.length}):*\n\n${formattedList}${helpFooter}` });
                     } catch (err) {
                         console.error('Error fetching groups:', err.message);
@@ -150,6 +159,7 @@ async function connectToWhatsApp() {
                     continue;
                 }
 
+                // 2. Select groups by numbers
                 if (command.startsWith('select ') || command.startsWith('בחר ')) {
                     if (lastFetchedGroupsList.length === 0) {
                         await sock.sendMessage(chatId, { text: 'Please send *list* first to get group numbers.' });
@@ -172,7 +182,7 @@ async function connectToWhatsApp() {
                     }
 
                     if (addedNames.length > 0) {
-                        saveSelectedGroups(selectedGroups);
+                        saveJson(GROUPS_FILE, selectedGroups);
                         await sock.sendMessage(chatId, { text: `*Added to tracking:*\n- ${addedNames.join('\n- ')}` });
                     } else {
                         await sock.sendMessage(chatId, { text: 'No valid group numbers found.' });
@@ -180,6 +190,7 @@ async function connectToWhatsApp() {
                     continue;
                 }
 
+                // 3. Remove groups by numbers
                 if (command.startsWith('remove ') || command.startsWith('הסר ')) {
                     if (lastFetchedGroupsList.length === 0) {
                         await sock.sendMessage(chatId, { text: 'Please send *list* first to remove by number.' });
@@ -202,7 +213,7 @@ async function connectToWhatsApp() {
                     }
 
                     if (removedNames.length > 0) {
-                        saveSelectedGroups(selectedGroups);
+                        saveJson(GROUPS_FILE, selectedGroups);
                         await sock.sendMessage(chatId, { text: `*Removed from tracking:*\n- ${removedNames.join('\n- ')}` });
                     } else {
                         await sock.sendMessage(chatId, { text: 'Specified numbers were not found in your tracked list.' });
@@ -210,30 +221,57 @@ async function connectToWhatsApp() {
                     continue;
                 }
 
+                // 4. Show currently tracked groups
                 if (command === 'groups' || command === 'קבוצות') {
                     const activeNames = Object.values(selectedGroups);
                     const listText = activeNames.length > 0
                         ? activeNames.map((name, i) => `${i + 1}. ${name}`).join('\n')
                         : 'No groups currently tracked. Send *list* to select groups.';
-                    await sock.sendMessage(chatId, { text: `*Currently Tracked Groups (${activeNames.length}):*\n${listText}` });
+                    await sock.sendMessage(chatId, { text: `*Currently Tracked Groups (${activeNames.length}):*\n${listText}\n\nDefault summary window: *${appConfig.defaultDays} day(s)*` });
+                    continue;
+                }
+                // 5. Update default days window (e.g., "days 5" or "ימים 5")
+                if (command.startsWith('days ') || command.startsWith('ימים ')) {
+                    const num = parseInt(trimmedText.replace(/^(days|ימים)\s+/i, '').trim(), 10);
+                    if (!isNaN(num) && num >= 1 && num <= MAX_RETENTION_DAYS) {
+                        appConfig.defaultDays = num;
+                        saveJson(CONFIG_FILE, appConfig);
+                        await sock.sendMessage(chatId, { text: `Default summary window updated to *${num} day(s)*.` });
+                    } else {
+                        await sock.sendMessage(chatId, { text: `Please specify a valid number between 1 and ${MAX_RETENTION_DAYS}.` });
+                    }
                     continue;
                 }
 
-                if (command === 'summarize' || command === 'סכם') {
-                    const cutoffTime = Date.now() - TWO_DAYS_MS;
-                    messageBuffer = messageBuffer.filter(m => m.timestamp >= cutoffTime);
+                // 6. Summarize messages with optional dynamic days (e.g., "summarize", "summarize 5", "סכם 3")
+                const summarizeMatch = command.match(/^(summarize|סכם)(?:\s+(\d+))?$/);
+                if (summarizeMatch) {
+                    const requestedDays = summarizeMatch ? parseInt(summarizeMatch, 10) : appConfig.defaultDays;
 
-                    if (messageBuffer.length === 0) {
-                        await sock.sendMessage(chatId, { text: 'No new messages found from the last 2 days to summarize.' });
+                    if (requestedDays < 1 || requestedDays > MAX_RETENTION_DAYS) {
+                        await sock.sendMessage(chatId, { text: `Please choose between 1 and ${MAX_RETENTION_DAYS} days.` });
                         continue;
                     }
 
-                    await sock.sendMessage(chatId, { text: `Summarizing ${messageBuffer.length} messages from the last 2 days...` });
+                    // Prune messages older than MAX_RETENTION_DAYS from disk
+                    const maxCutoff = Date.now() - (MAX_RETENTION_DAYS * DAY_MS);
+                    messageBuffer = messageBuffer.filter(m => m.timestamp >= maxCutoff);
+                    saveJson(MESSAGES_FILE, messageBuffer);
+
+                    // Filter messages for the requested days window
+                    const targetCutoff = Date.now() - (requestedDays * DAY_MS);
+                    const targetMessages = messageBuffer.filter(m => m.timestamp >= targetCutoff);
+
+                    if (targetMessages.length === 0) {
+                        await sock.sendMessage(chatId, { text: `No messages found from the last ${requestedDays} day(s).` });
+                        continue;
+                    }
+
+                    await sock.sendMessage(chatId, { text: `Summarizing ${targetMessages.length} messages from the last ${requestedDays} day(s)...` });
 
                     try {
-                        const summary = await summarizeMessages(messageBuffer);
-                        await sock.sendMessage(chatId, { text: `*Summary (Last 2 Days):*\n\n${summary}` });
-                        messageBuffer = [];
+                        const summary = await summarizeMessages(targetMessages, requestedDays);
+                        await sock.sendMessage(chatId, { text: `*Summary (Last ${requestedDays} Day(s)):*\n\n${summary}` });
                     } catch (err) {
                         console.error('OpenAI API Error:', err.message);
                         await sock.sendMessage(chatId, { text: 'Error generating summary. Check logs.' });
@@ -242,6 +280,7 @@ async function connectToWhatsApp() {
                 }
             }
 
+            // Collect and persist messages from tracked groups
             if (chatId.endsWith('@g.us') && selectedGroups[chatId]) {
                 const groupName = selectedGroups[chatId];
                 messageBuffer.push({
@@ -251,13 +290,20 @@ async function connectToWhatsApp() {
                     text: text,
                     timestamp: Date.now()
                 });
-                console.log(`[Saved] Group: "${groupName}" | Sender: ${senderName} | Buffer size: ${messageBuffer.length}`);
+
+                // Keep buffer clean and persist to disk
+                const maxCutoff = Date.now() - (MAX_RETENTION_DAYS * DAY_MS);
+                if (messageBuffer.length > 5000) {
+                    messageBuffer = messageBuffer.filter(m => m.timestamp >= maxCutoff);
+                }
+                saveJson(MESSAGES_FILE, messageBuffer);
+
+                console.log(`[Saved] Group: "${groupName}" | Sender: ${senderName} | Total stored: ${messageBuffer.length}`);
             }
         }
     });
 }
 
-// Start HTTP server immediately on 0.0.0.0 so Railway healthcheck and QR page always respond
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -271,3 +317,6 @@ http.createServer((req, res) => {
 });
 
 connectToWhatsApp();
+
+
+            
