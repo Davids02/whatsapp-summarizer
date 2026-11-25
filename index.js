@@ -209,14 +209,12 @@ async function connectToWhatsApp() {
 
             if (!text) continue;
 
-            const myPhoneJid = sock.user.id.split(':').at(0) + '@s.whatsapp.net';
-            const myLid = sock.user.lid ? sock.user.lid.split(':').at(0) + '@lid' : '';
-            const isSelfChat = (chatId === myPhoneJid || chatId === myLid);
-
+            const isPrivateChat = !chatId.endsWith('@g.us') && chatId !== 'status@broadcast';
             const trimmedText = text.trim();
             const command = trimmedText.toLowerCase();
 
-            if (type === 'notify' && isFromMe && isSelfChat) {
+            if (isFromMe && isPrivateChat) {
+
                 if (command === 'list' || command === 'רשימה') {
                     await sock.sendMessage(chatId, { text: 'Fetching your WhatsApp groups...' });
                     try {
