@@ -141,7 +141,7 @@ async function connectToWhatsApp() {
         auth: state,
         logger: pino({ level: 'silent' }),
         browser: Browsers.macOS('Chrome'),
-        syncFullHistory: true
+        syncFullHistory: false
     });
 
     sock.ev.on('creds.update', saveCreds);
