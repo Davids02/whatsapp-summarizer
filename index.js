@@ -99,7 +99,11 @@ async function storeGroupMessage(sock, msg) {
     const msgId = msg.key.id;
     if (msgId && savedMessageIds.has(msgId)) return false;
 
-    const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
+    const text = msg.message.conversation 
+    || msg.message.extendedTextMessage?.text 
+    || msg.message.imageMessage?.caption 
+    || msg.message.videoMessage?.caption;
+
     if (!text) return false;
 
     const rawTs = Number(msg.messageTimestamp);
