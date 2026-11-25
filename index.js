@@ -68,7 +68,7 @@ async function summarizeMessages(messagesList, daysCount) {
         ],
     });
 
-    return response.choices.message.content;
+    return response.choices[0].message.content;
 }
 
 
