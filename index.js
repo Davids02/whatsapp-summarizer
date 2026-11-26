@@ -136,11 +136,24 @@ async function storeGroupMessage(sock, msg) {
     return true;
 }
 
+let activeSock = null;
+let keepAliveInterval = null;
+
 async function connectToWhatsApp() {
+    if (activeSock) {
+        try { activeSock.end(undefined); } catch {}
+        activeSock = null;
+    }
+    if (keepAliveInterval) {
+        clearInterval(keepAliveInterval);
+        keepAliveInterval = null;
+    }
+
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
+        activeSock = sock;
         version,
         auth: state,
         logger: pino({ level: 'silent' }),
@@ -175,6 +188,14 @@ async function connectToWhatsApp() {
             connectionStatus = 'Connected successfully!';
             const activeCount = Object.keys(selectedGroups).length;
             console.log(`\nConnected successfully! Tracking ${activeCount} groups. Stored messages (last 7 days): ${messageBuffer.length}`);
+                        keepAliveInterval = setInterval(async () => {
+                try {
+                    await sock.sendPresenceUpdate('available');
+                } catch (err) {
+                    console.log('Keep-alive failed, forcing reconnect...');
+                    connectToWhatsApp();
+                }
+            }, 15 * 60 * 1000); // Every 15 minutes
         }
 
     });
