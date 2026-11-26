@@ -19,9 +19,11 @@ const QRCode = require('qrcode');
 
 // ───────────────────────── Config ─────────────────────────
 
-const WEB_TOKEN = process.env.WEB_TOKEN;
-if (!WEB_TOKEN || WEB_TOKEN.length < 16) {
-    console.error('FATAL: WEB_TOKEN env var is required (at least 16 chars). Protects the QR/status page.');
+const WEB_TOKEN = process.env.WEB_TOKEN || '';
+if (!WEB_TOKEN) {
+    console.warn('NOTE: WEB_TOKEN not set. The status/QR page is open to anyone who knows the URL. Set WEB_TOKEN to protect it.');
+} else if (WEB_TOKEN.length < 16) {
+    console.error('FATAL: WEB_TOKEN must be at least 16 chars (or remove it to disable protection).');
     process.exit(1);
 }
 if (!process.env.OPENAI_API_KEY) {
@@ -573,29 +575,64 @@ async function connectToWhatsApp() {
     });
 }
 
-// ───────────────────────── Web server (token protected) ─────────────────────────
+// ───────────────────────── Web server (token protected, cookie login) ─────────────────────────
 
-function tokenOk(provided) {
-    const a = Buffer.from(String(provided || ''));
-    const b = Buffer.from(WEB_TOKEN);
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
+const COOKIE_NAME = 'wa_auth';
+const COOKIE_VALUE = crypto.createHash('sha256').update('wa-cookie:' + WEB_TOKEN).digest('hex');
+const COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // 30 days
+
+function safeEqual(a, b) {
+    const x = Buffer.from(String(a || ''));
+    const y = Buffer.from(String(b || ''));
+    return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+function tokenOk(provided) { return safeEqual(provided, WEB_TOKEN); }
+
+function getCookie(req, name) {
+    const header = req.headers.cookie || '';
+    for (const part of header.split(';')) {
+        const [k, ...v] = part.trim().split('=');
+        if (k === name) return v.join('=');
+    }
+    return null;
+}
+
+function isAuthed(req, url) {
+    if (!WEB_TOKEN) return true;
+    return safeEqual(getCookie(req, COOKIE_NAME), COOKIE_VALUE) || tokenOk(url.searchParams.get('token'));
+}
+
+// Basic brute-force protection: 10 failed logins per 15 minutes per IP
+const failedLogins = new Map();
+function clientIp(req) {
+    return (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString().split(',')[0].trim();
+}
+function isBlocked(ip) {
+    const rec = failedLogins.get(ip);
+    if (!rec) return false;
+    if (Date.now() - rec.first > 15 * 60 * 1000) { failedLogins.delete(ip); return false; }
+    return rec.count >= 10;
+}
+function recordFailure(ip) {
+    const rec = failedLogins.get(ip);
+    if (!rec || Date.now() - rec.first > 15 * 60 * 1000) failedLogins.set(ip, { count: 1, first: Date.now() });
+    else rec.count++;
 }
 
 function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+const PAGE_STYLE = 'text-align:center;font-family:sans-serif;margin-top:50px;';
+const wrap = (inner, refresh) => `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${refresh ? '<meta http-equiv="refresh" content="15">' : ''}</head><body style="${PAGE_STYLE}">${inner}</body></html>`;
+
+const loginPage = (msg) => wrap(`<h2>Login</h2>${msg ? `<p style="color:#b00">${escapeHtml(msg)}</p>` : ''}<form method="POST" action="/login"><input type="password" name="token" placeholder="WEB_TOKEN" autofocus style="padding:8px;width:260px"/> <button type="submit" style="padding:8px 16px">Enter</button></form>`);
+
 const PORT = process.env.PORT || 3000;
 const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
-
-    // Unauthenticated health check (reveals nothing)
-    if (url.pathname === '/health') {
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        return res.end('ok');
-    }
-
-    const headers = {
+    const baseHeaders = {
         'Content-Type': 'text/html; charset=utf-8',
         'Cache-Control': 'no-store',
         'X-Frame-Options': 'DENY',
@@ -603,18 +640,52 @@ const server = http.createServer((req, res) => {
         'Referrer-Policy': 'no-referrer'
     };
 
-    if (!tokenOk(url.searchParams.get('token'))) {
-        res.writeHead(401, { ...headers, 'Content-Type': 'text/plain' });
-        return res.end('Unauthorized');
+    // Unauthenticated health check (reveals nothing)
+    if (url.pathname === '/health') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        return res.end('ok');
     }
 
-    res.writeHead(200, headers);
-    const wrap = (inner) => `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="15"></head><body style="text-align:center;font-family:sans-serif;margin-top:50px;">${inner}</body></html>`;
+    // Login form submit
+    if (url.pathname === '/login' && req.method === 'POST') {
+        const ip = clientIp(req);
+        if (isBlocked(ip)) {
+            res.writeHead(429, baseHeaders);
+            return res.end(loginPage('Too many attempts. Try again in 15 minutes.'));
+        }
+        let body = '';
+        req.on('data', chunk => {
+            body += chunk;
+            if (body.length > 2048) req.destroy();
+        });
+        req.on('end', () => {
+            const submitted = new URLSearchParams(body).get('token');
+            if (tokenOk(submitted && submitted.trim())) {
+                failedLogins.delete(ip);
+                res.writeHead(303, {
+                    ...baseHeaders,
+                    'Set-Cookie': `${COOKIE_NAME}=${COOKIE_VALUE}; Max-Age=${COOKIE_MAX_AGE}; Path=/; HttpOnly; Secure; SameSite=Strict`,
+                    Location: '/'
+                });
+                return res.end();
+            }
+            recordFailure(ip);
+            res.writeHead(401, baseHeaders);
+            res.end(loginPage('Wrong token.'));
+        });
+        return;
+    }
 
+    if (!isAuthed(req, url)) {
+        res.writeHead(401, baseHeaders);
+        return res.end(loginPage());
+    }
+
+    res.writeHead(200, baseHeaders);
     if (latestQrDataUrl) {
-        res.end(wrap(`<h2>Scan with WhatsApp</h2><img src="${latestQrDataUrl}" style="width:300px;height:300px;border:1px solid #ccc;"/><p>Page refreshes automatically</p>`));
+        res.end(wrap(`<h2>Scan with WhatsApp</h2><img src="${latestQrDataUrl}" style="width:300px;height:300px;border:1px solid #ccc;"/><p>Page refreshes automatically</p>`, true));
     } else {
-        res.end(wrap(`<h2>Status: ${escapeHtml(connectionStatus)}</h2><p>Tracked groups: ${Object.keys(selectedGroups).length}</p><p>Stored messages (last 7 days): ${messageBuffer.length}</p>`));
+        res.end(wrap(`<h2>Status: ${escapeHtml(connectionStatus)}</h2><p>Tracked groups: ${Object.keys(selectedGroups).length}</p><p>Stored messages (last 7 days): ${messageBuffer.length}</p>`, true));
     }
 });
 
