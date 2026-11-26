@@ -23,7 +23,7 @@ const MESSAGES_FILE = path.join(DATA_DIR, 'messages_history.json');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const MAX_RETENTION_DAYS = 7; // Keep messages only from the last 7 days
+const MAX_RETENTION_DAYS = 7;
 
 function loadJson(filePath, fallback) {
     if (fs.existsSync(filePath)) {
@@ -44,15 +44,16 @@ let selectedGroups = loadJson(GROUPS_FILE, {});
 let messageBuffer = loadJson(MESSAGES_FILE, []);
 let appConfig = loadJson(CONFIG_FILE, { defaultDays: 2 });
 
-// Track saved message IDs to prevent duplicates
 let savedMessageIds = new Set(messageBuffer.map(m => m.id).filter(Boolean));
 const groupNamesCache = new Map(Object.entries(selectedGroups));
 
 let lastFetchedGroupsList = [];
 let latestQrDataUrl = null;
 let connectionStatus = 'Initializing...';
+let activeSock = null;
+let keepAliveInterval = null;
+let reconnectTimeout = null;
 
-// Remove messages older than 7 days from memory and disk
 function pruneOldMessages() {
     const cutoff = Date.now() - (MAX_RETENTION_DAYS * DAY_MS);
     const initialCount = messageBuffer.length;
@@ -61,13 +62,22 @@ function pruneOldMessages() {
     if (messageBuffer.length !== initialCount) {
         savedMessageIds = new Set(messageBuffer.map(m => m.id).filter(Boolean));
         saveJson(MESSAGES_FILE, messageBuffer);
-        console.log(`[Cleanup] Removed ${initialCount - messageBuffer.length} messages older than 7 days. Remaining: ${messageBuffer.length}`);
+        console.log(`[Cleanup] Removed ${initialCount - messageBuffer.length} old messages. Remaining: ${messageBuffer.length}`);
     }
 }
 
-// Run cleanup immediately on startup and then every 1 hour
 pruneOldMessages();
 setInterval(pruneOldMessages, 60 * 60 * 1000);
+
+function extractMessageText(messageObj) {
+    if (!messageObj) return null;
+    return messageObj.conversation
+        || messageObj.extendedTextMessage?.text
+        || messageObj.imageMessage?.caption
+        || messageObj.videoMessage?.caption
+        || messageObj.documentMessage?.caption
+        || null;
+}
 
 async function summarizeMessages(messagesList, daysCount) {
     const formattedChat = messagesList
@@ -90,7 +100,6 @@ async function summarizeMessages(messagesList, daysCount) {
 
     return response.choices.at(0).message.content;
 }
-
 async function storeGroupMessage(sock, msg) {
     if (!msg.message || !msg.key) return false;
     const chatId = msg.key.remoteJid;
@@ -99,18 +108,13 @@ async function storeGroupMessage(sock, msg) {
     const msgId = msg.key.id;
     if (msgId && savedMessageIds.has(msgId)) return false;
 
-    const text = msg.message.conversation 
-    || msg.message.extendedTextMessage?.text 
-    || msg.message.imageMessage?.caption 
-    || msg.message.videoMessage?.caption;
-
+    const text = extractMessageText(msg.message);
     if (!text) return false;
 
     const rawTs = Number(msg.messageTimestamp);
     const timestamp = rawTs ? rawTs * 1000 : Date.now();
     const maxCutoff = Date.now() - (MAX_RETENTION_DAYS * DAY_MS);
 
-    // Ignore any message older than 7 days
     if (timestamp < maxCutoff) return false;
 
     let groupName = selectedGroups[chatId] || groupNamesCache.get(chatId);
@@ -136,31 +140,33 @@ async function storeGroupMessage(sock, msg) {
     return true;
 }
 
-let activeSock = null;
-let keepAliveInterval = null;
-
 async function connectToWhatsApp() {
-    if (activeSock) {
-        try { activeSock.end(undefined); } catch {}
-        activeSock = null;
+    if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
     }
     if (keepAliveInterval) {
         clearInterval(keepAliveInterval);
         keepAliveInterval = null;
+    }
+    if (activeSock) {
+        try { activeSock.end(undefined); } catch {}
+        activeSock = null;
     }
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
-        activeSock = sock;
         version,
         auth: state,
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome'),
-        syncFullHistory: true
+        browser: Browsers.macOS('Chrome'),
+        syncFullHistory: false,
+        keepAliveIntervalMs: 30000
     });
 
+    activeSock = sock;
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
@@ -169,38 +175,41 @@ async function connectToWhatsApp() {
         if (qr) {
             latestQrDataUrl = await QRCode.toDataURL(qr);
             connectionStatus = 'Waiting for QR scan...';
-            console.log('QR image generated! Refresh your Railway domain URL to scan.');
+            console.log('QR image generated! Open your Railway domain URL to scan.');
         }
 
         if (connection === 'close') {
+            if (keepAliveInterval) {
+                clearInterval(keepAliveInterval);
+                keepAliveInterval = null;
+            }
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 428) {
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
                 console.log('Session logged out (401). Clearing auth directory...');
                 fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                 connectionStatus = 'Logged out. Generating new QR...';
             } else {
-                connectionStatus = 'Connection closed. Reconnecting in 3s...';
-                console.log(`Connection closed (code: ${statusCode}). Reconnecting in 3s...`);
+                connectionStatus = 'Connection closed. Reconnecting in 5s...';
+                console.log(`Connection closed (code: ${statusCode}). Reconnecting in 5s...`);
             }
-            setTimeout(() => connectToWhatsApp(), 3000);
+            reconnectTimeout = setTimeout(() => connectToWhatsApp(), 5000);
         } else if (connection === 'open') {
             latestQrDataUrl = null;
             connectionStatus = 'Connected successfully!';
             const activeCount = Object.keys(selectedGroups).length;
             console.log(`\nConnected successfully! Tracking ${activeCount} groups. Stored messages (last 7 days): ${messageBuffer.length}`);
-                        keepAliveInterval = setInterval(async () => {
+
+            keepAliveInterval = setInterval(async () => {
                 try {
                     await sock.sendPresenceUpdate('available');
                 } catch (err) {
                     console.log('Keep-alive failed, forcing reconnect...');
                     connectToWhatsApp();
                 }
-            }, 15 * 60 * 1000); // Every 15 minutes
+            }, 15 * 60 * 1000);
         }
-
     });
 
-    // Catch past messages pushed by WhatsApp upon linking, keeping only the last 7 days
     sock.ev.on('messaging-history.set', async ({ messages, chats }) => {
         if (chats) {
             for (const chat of chats) {
@@ -216,10 +225,9 @@ async function connectToWhatsApp() {
         if (addedCount > 0) {
             pruneOldMessages();
             saveJson(MESSAGES_FILE, messageBuffer);
-            console.log(`[History Sync] Imported ${addedCount} messages from the last 7 days. Total stored: ${messageBuffer.length}`);
+            console.log(`[History Sync] Imported ${addedCount} messages. Total stored: ${messageBuffer.length}`);
         }
     });
-
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify' && type !== 'append') return;
 
@@ -230,7 +238,7 @@ async function connectToWhatsApp() {
 
             const chatId = msg.key.remoteJid;
             const isFromMe = msg.key.fromMe;
-            const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
+            const text = extractMessageText(msg.message);
 
             if (!text) continue;
 
@@ -239,6 +247,10 @@ async function connectToWhatsApp() {
             const command = trimmedText.toLowerCase();
 
             if (isFromMe && isPrivateChat) {
+                if (command === 'ping' || command === 'סטטוס') {
+                    await sock.sendMessage(chatId, { text: `Online! Tracking ${Object.keys(selectedGroups).length} groups. Stored messages (7d): ${messageBuffer.length}` });
+                    continue;
+                }
 
                 if (command === 'list' || command === 'רשימה') {
                     await sock.sendMessage(chatId, { text: 'Fetching your WhatsApp groups...' });
@@ -260,7 +272,7 @@ async function connectToWhatsApp() {
                             })
                             .join('\n');
 
-                        const helpFooter = '\n\nCommands:\n• *select 1, 4*\n• *remove 1, 4*\n• *summarize 3* (1-7 days back)\n• *days 5* (set default days)';
+                        const helpFooter = '\n\nCommands:\n• *select 1, 4*\n• *remove 1, 4*\n• *summarize 3* / *סכם קבוצה 1*\n• *days 5* (set default)';
                         await sock.sendMessage(chatId, { text: `*Your WhatsApp Groups (${lastFetchedGroupsList.length}):*\n\n${formattedList}${helpFooter}` });
                     } catch (err) {
                         console.error('Error fetching groups:', err.message);
@@ -337,7 +349,6 @@ async function connectToWhatsApp() {
                     await sock.sendMessage(chatId, { text: `*Currently Tracked Groups (${activeNames.length}):*\n${listText}\n\nDefault summary window: *${appConfig.defaultDays} day(s)*` });
                     continue;
                 }
-
                 if (command.startsWith('days ') || command.startsWith('ימים ')) {
                     const num = parseInt(trimmedText.replace(/^(days|ימים)\s+/i, '').trim(), 10);
                     if (!isNaN(num) && num >= 1 && num <= MAX_RETENTION_DAYS) {
@@ -350,9 +361,10 @@ async function connectToWhatsApp() {
                     continue;
                 }
 
-                const summarizeMatch = command.match(/^(summarize|סכם)(?:\s+(\d+))?$/);
+                const summarizeMatch = command.match(/^(summarize|סכם)(?:\s+(\d+))?(?:\s+(?:group|קבוצה)\s+(\d+))?$/);
                 if (summarizeMatch) {
                     const requestedDays = summarizeMatch.at(2) ? parseInt(summarizeMatch.at(2), 10) : appConfig.defaultDays;
+                    const groupIndex = summarizeMatch.at(3) ? parseInt(summarizeMatch.at(3), 10) : null;
 
                     if (requestedDays < 1 || requestedDays > MAX_RETENTION_DAYS) {
                         await sock.sendMessage(chatId, { text: `Please choose between 1 and ${MAX_RETENTION_DAYS} days.` });
@@ -361,19 +373,38 @@ async function connectToWhatsApp() {
 
                     pruneOldMessages();
 
-                    const targetCutoff = Date.now() - (requestedDays * DAY_MS);
-                    const targetMessages = messageBuffer.filter(m => m.timestamp >= targetCutoff && selectedGroups[m.groupId]);
-
-                    if (targetMessages.length === 0) {
-                        await sock.sendMessage(chatId, { text: `No messages found from your tracked groups in the last ${requestedDays} day(s).` });
+                    const trackedEntries = Object.entries(selectedGroups);
+                    if (trackedEntries.length === 0) {
+                        await sock.sendMessage(chatId, { text: 'No groups are currently tracked. Send *list* and *select* first.' });
                         continue;
                     }
 
-                    await sock.sendMessage(chatId, { text: `Summarizing ${targetMessages.length} messages from the last ${requestedDays} day(s)...` });
+                    let targetGroupIds = new Set(trackedEntries.map(entry => entry.at(0)));
+                    let scopeLabel = 'All Tracked Groups';
+
+                    if (groupIndex !== null) {
+                        const chosenEntry = trackedEntries.at(groupIndex - 1);
+                        if (!chosenEntry) {
+                            await sock.sendMessage(chatId, { text: `Group #${groupIndex} not found. Send *groups* to see your tracked group numbers.` });
+                            continue;
+                        }
+                        targetGroupIds = new Set([chosenEntry.at(0)]);
+                        scopeLabel = chosenEntry.at(1);
+                    }
+
+                    const targetCutoff = Date.now() - (requestedDays * DAY_MS);
+                    const targetMessages = messageBuffer.filter(m => m.timestamp >= targetCutoff && targetGroupIds.has(m.groupId));
+
+                    if (targetMessages.length === 0) {
+                        await sock.sendMessage(chatId, { text: `No messages found for *${scopeLabel}* in the last ${requestedDays} day(s).` });
+                        continue;
+                    }
+
+                    await sock.sendMessage(chatId, { text: `Summarizing ${targetMessages.length} messages for *${scopeLabel}* (last ${requestedDays} day(s))...` });
 
                     try {
                         const summary = await summarizeMessages(targetMessages, requestedDays);
-                        await sock.sendMessage(chatId, { text: `*Summary (Last ${requestedDays} Day(s)):*\n\n${summary}` });
+                        await sock.sendMessage(chatId, { text: `*Summary — ${scopeLabel} (Last ${requestedDays} Day(s)):*\n\n${summary}` });
                     } catch (err) {
                         console.error('OpenAI API Error:', err.message);
                         await sock.sendMessage(chatId, { text: 'Error generating summary. Check logs.' });
